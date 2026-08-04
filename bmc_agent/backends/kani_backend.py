@@ -486,11 +486,38 @@ def _scan_pointer_newtypes(crate_root: "Path | str | None") -> dict[str, dict]:
     return out
 
 
+def _enum_init_block(enum_name: str, variants: list[str], name: str) -> list[str]:
+    """Nondeterministically construct a crate-local *unit-variant* enum.
+
+    Emits a ``match`` on a nondet ``u8`` discriminant selecting one of the
+    enum's variants, so Kani explores every arm without the type needing
+    ``impl kani::Arbitrary``. Only unit variants are constructed here --
+    payload variants (tuple/struct) are filtered out by the parser so this
+    is only called for all-unit enums (e.g. ``IntegerEncodeState``).
+    """
+    disc = f"_disc_{name}"
+    arms: list[str] = []
+    last = len(variants) - 1
+    for i, vname in enumerate(variants):
+        ctor = f"{enum_name}::{vname}"
+        # the final arm doubles as the exhaustive `_` catch so rustc is happy
+        # (u8 has 256 values; discriminants >= n fold onto the last variant).
+        key = "_" if i == last else str(i)
+        arms.append(f"        {key} => {ctor},")
+    return [
+        f"    let {disc}: u8 = kani::any();",
+        f"    let {name}: {enum_name} = match {disc} {{",
+        *arms,
+        f"    }};",
+    ]
+
+
 def _param_init_block(
     rust_type: str,
     name: str,
     slice_bound: int = _DEFAULT_SLICE_BOUND,
     pointer_newtypes: dict | None = None,
+    enums: dict | None = None,
 ) -> list[str]:
     """Return the Kani init statements needed to bind *name* to a
     nondeterministic value of *rust_type*.
@@ -680,6 +707,8 @@ def _param_init_block(
             f"    let {name}: {t} = "
             f"std::str::from_utf8(&{backing}[..{length}]).unwrap();",
         ]
+    if enums and t in enums:
+        return _enum_init_block(t, enums[t], name)
     return [f"    let {name}: {t} = {_initialiser_for(t)};"]
 
 
@@ -743,6 +772,36 @@ def _translate_dsl(predicate: str, result_var: str = "result") -> str:
     # left/right to find the enclosing parentheses and rewrite the
     # substring as a whole.
     return _rewrite_implications(expr)
+
+
+def _rewrite_result_access(post_expr: str, rv: str) -> "tuple[str, bool]":
+    """Rewrite ``Result`` value accessors on *rv* to use pre-bound locals.
+
+    The LLM writes ``result.unwrap()`` / ``result.unwrap_err()`` (and
+    sometimes ``.ok().unwrap()`` / ``.err().unwrap()``) in postconditions.
+    Two problems: (1) ``Result::unwrap`` needs ``E: Debug`` and
+    ``Result::unwrap_err`` needs ``T: Debug`` -- bounds crate types often
+    lack (ylong_http's ``IntegerDecoder`` has no Debug); (2) both CONSUME
+    the Result, so a multi-clause spec that touches the value more than
+    once fails E0382 (use of moved value).
+
+    The caller pre-binds ``_ok_val``/``_err_val`` (``Option<&T>`` Copy
+    locals from a single ``match &result``) -- this rewrite points the
+    accessors at them. ``Option::unwrap`` is bound-free (panics with a
+    fixed string) and the locals are ``Copy``, so both problems vanish.
+
+    ponytail: ``*_ok_val.unwrap()`` derefs for Ok-value comparison, valid
+    when the Ok type is ``Copy`` (the safety-verification common case:
+    usize/u8/bool). Non-Copy Ok value-compares still fail; field access
+    via ``_err_val.unwrap().field`` auto-derefs and always works.
+    """
+    orig = post_expr
+    # Specific (longer) patterns first so bare .unwrap() never partially matches.
+    post_expr = post_expr.replace(f"{rv}.ok().unwrap()", "*_ok_val.unwrap()")
+    post_expr = post_expr.replace(f"{rv}.err().unwrap()", "_err_val.unwrap()")
+    post_expr = post_expr.replace(f"{rv}.unwrap_err()", "_err_val.unwrap()")
+    post_expr = post_expr.replace(f"{rv}.unwrap()", "*_ok_val.unwrap()")
+    return post_expr, post_expr != orig
 
 
 def _rewrite_implications(expr: str) -> str:
@@ -1349,26 +1408,36 @@ class KaniBackend(BMCBackend):
 
         # Pre-emit type-resolvability gate. Functions whose signature or body
         # references types not defined in this source file (and not stdlib /
-        # known external alias) can't compile standalone — the historical
+        # known external alias) can't compile STANDALONE — the historical
         # pattern is CCC's impl-block methods that reference Operand /
         # EncodeResult / RelocType from sibling parser.rs / state.rs files.
         # Emitting a harness for those produces ~500 noise E0412 reports per
         # sweep; gate them out cleanly and let the pipeline mark them as
         # "harness-skipped-unresolvable-types".
-        file_source_for_gate = _load_full_source(func, parsed_file)
-        unresolved = _function_references_unresolvable_types(
-            func, parsed_file, file_source_for_gate
-        )
-        if unresolved:
-            # Drop external aliases we WILL inject; if everything left is
-            # genuinely unresolvable, raise a marker so the engine records
-            # the skip without trying to compile.
-            real_unresolved = unresolved - set(_EXTERNAL_TYPE_ALIASES.keys())
-            if real_unresolved:
-                raise HarnessUnresolvableTypes(
-                    function_name=func.name,
-                    unresolved_types=sorted(real_unresolved),
-                )
+        #
+        # In cargo-mode (kani_real_crate) this gate is WRONG: the harness is
+        # appended to the real crate, so cross-file types (e.g. uri/mod.rs
+        # returning sibling-file types Scheme/Authority/InvalidUri) resolve
+        # naturally, and cargo compiles one harness at a time so an
+        # unresolved type yields a clean per-fn error, not sweep pollution.
+        # Let the cargo compiler be the authority there.
+        _cargo_mode_gate = bool(getattr(self._config, "kani_real_crate", False)
+                                 and getattr(func, "source_file", ""))
+        if not _cargo_mode_gate:
+            file_source_for_gate = _load_full_source(func, parsed_file)
+            unresolved = _function_references_unresolvable_types(
+                func, parsed_file, file_source_for_gate
+            )
+            if unresolved:
+                # Drop external aliases we WILL inject; if everything left is
+                # genuinely unresolvable, raise a marker so the engine records
+                # the skip without trying to compile.
+                real_unresolved = unresolved - set(_EXTERNAL_TYPE_ALIASES.keys())
+                if real_unresolved:
+                    raise HarnessUnresolvableTypes(
+                        function_name=func.name,
+                        unresolved_types=sorted(real_unresolved),
+                    )
 
         # 1. Nondeterministic parameter initialisation.  For each parameter
         #    we also record the call-site expression — typically just the
@@ -1395,6 +1464,7 @@ class KaniBackend(BMCBackend):
             init_lines.extend(_param_init_block(
                 ty, name, slice_bound=slice_bound,
                 pointer_newtypes=_ptr_newtypes,
+                enums=getattr(parsed_file, "enums", {}),
             ))
             arg_names.append(name)
             call_args_list.append(_call_site_expr(ty, name))
@@ -1465,14 +1535,23 @@ class KaniBackend(BMCBackend):
                     f"self-method {func.name}: no struct def for receiver {_base!r}")
             _recv_lines = []
             _assigns = []
+            _fvs = []
             for _fn2, _ft2 in _fields:
                 _fv = "recv_" + _fn2
+                _fvs.append(_fv)
                 _recv_lines.extend(_param_init_block(
-                    _ft2, _fv, slice_bound=slice_bound, pointer_newtypes=_ptr_newtypes))
+                    _ft2, _fv, slice_bound=slice_bound, pointer_newtypes=_ptr_newtypes,
+                    enums=getattr(parsed_file, "enums", {})))
                 _assigns.append(f"{_fn2}: {_fv}")
             _mut = "mut " if getattr(func.signature, "receiver_is_mut", False) else ""
-            _recv_lines.append(
-                f"    let {_mut}recv: {impl_type} = {impl_type} {{ {', '.join(_assigns)} }};")
+            _is_tuple = _base in (getattr(parsed_file, "tuple_structs", set()) or set())
+            if _is_tuple:
+                # Tuple struct: `StatusCode(200)` not `StatusCode { _0: 200 }`
+                _recv_lines.append(
+                    f"    let {_mut}recv: {impl_type} = {impl_type}({', '.join(_fvs)});")
+            else:
+                _recv_lines.append(
+                    f"    let {_mut}recv: {impl_type} = {impl_type} {{ {', '.join(_assigns)} }};")
             init_lines = _recv_lines + init_lines
             call_target = f"recv.{func.name}"
         is_unsafe_fn = "unsafe" in (getattr(func.signature, "modifiers", []) or [])
@@ -1516,6 +1595,20 @@ class KaniBackend(BMCBackend):
         if getattr(func.signature, "has_self_receiver", False) and raw_pre:
             raw_pre = _re_self.sub(r"\bself\b", "recv", raw_pre)
         post_expr = _translate_dsl(rewritten_post, result_var=result_binding or "result")
+        # Result postconditions access Ok/Err via .unwrap()/.unwrap_err(),
+        # which need Debug bounds the crate type often lacks AND consume
+        # `result` (breaking multi-clause specs). Destructure &result once
+        # into Copy Option<&T> locals and point accessors at them: bound-free
+        # + move-free. Only when result is a Result and the spec uses them.
+        _rv = result_binding or "result"
+        result_preamble: list[str] = []
+        if "Result<" in (return_type or ""):
+            post_expr, _rewrote = _rewrite_result_access(post_expr, _rv)
+            if _rewrote:
+                result_preamble.append(
+                    f"    let (_ok_val, _err_val) = match &{_rv} {{"
+                    " Ok(v) => (Some(v), None), Err(e) => (None, Some(e)) };"
+                )
         post_line = (
             f"    kani::assert({post_expr}, \"postcondition violated\");"
             if post_expr != "true"
@@ -1604,6 +1697,8 @@ class KaniBackend(BMCBackend):
         if old_snapshots:
             parts.extend(old_snapshots)
         parts.append(call_line)
+        if result_preamble:
+            parts.extend(result_preamble)
         if post_line:
             parts.append(post_line)
         parts.append("}")

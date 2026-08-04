@@ -540,7 +540,7 @@ class Config:
     # than CBMC's; the unwind is left at None so kani picks its own when
     # absent (we still surface the field to give the pipeline a single knob).
     kani_path: str = "kani"
-    kani_unwind: int = 4
+    kani_unwind: int = 12
     kani_timeout: int = 120  # seconds
     # Cargo-mode for Kani: run the harness as a test inside the host crate
     # via `cargo kani --tests --harness <name>` instead of as a standalone
@@ -987,7 +987,7 @@ class Config:
             scale_down_size=int(os.environ.get("BMC_AGENT_SCALE_DOWN_SIZE", "4")),
             safety_only=os.environ.get("BMC_AGENT_SAFETY_ONLY", "false").lower() == "true",
             kani_path=os.environ.get("BMC_AGENT_KANI_PATH", "kani"),
-            kani_unwind=int(os.environ.get("BMC_AGENT_KANI_UNWIND", "4")),
+            kani_unwind=int(os.environ.get("BMC_AGENT_KANI_UNWIND", "12")),
             kani_timeout=int(os.environ.get("BMC_AGENT_KANI_TIMEOUT", "120")),
             kani_slice_bound=int(os.environ.get("BMC_AGENT_KANI_SLICE_BOUND", "4")),
             kani_real_crate=os.environ.get("BMC_AGENT_KANI_REAL_CRATE", "false").lower() == "true",

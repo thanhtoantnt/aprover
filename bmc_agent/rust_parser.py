@@ -103,6 +103,14 @@ class ParsedRustFile:
     # top-level struct definitions; used by the self-method harness generator
     # to construct a receiver (build the impl type field-by-field).
     structs: dict = field(default_factory=dict)
+    # enum_name -> list of variant names, populated ONLY for all-unit-variant
+    # enums (e.g. `enum State { A, B, C }`). Used by the harness generator to
+    # nondeterministically construct a variant without `impl Arbitrary`.
+    # Payload enums (tuple/struct variants) are skipped so the existing
+    # unresolvable-type fallback applies (no regression).
+    enums: dict = field(default_factory=dict)
+    # names of tuple structs (Type(val) constructor, not Type { field: val })
+    tuple_structs: set = field(default_factory=set)
 
     def get_function_info(self, name: str) -> Optional[RustFunctionInfo]:
         if name not in self.functions:
@@ -175,6 +183,8 @@ def parse_rust_file(
     call_graph: dict[str, set[str]] = {}
     function_bodies: dict[str, str] = {}
     structs: dict[str, list] = {}
+    tuple_structs: set[str] = set()  # names of tuple structs (Type(val), not Type { field: val })
+    enums: dict[str, list[str]] = {}
 
     def _ingest_struct(struct_node) -> None:
         name_node = struct_node.child_by_field_name("name")
@@ -183,7 +193,14 @@ def parse_rust_file(
         sname = _slice(src_bytes, name_node)
         body = struct_node.child_by_field_name("body")
         fields: list[tuple[str, str]] = []
-        if body is not None:
+        if body is not None and body.type == "ordered_field_declaration_list":
+            # Tuple struct: `struct Foo(u16, String);` — children are bare
+            # type nodes (no name field). Record positional names `_0`,`_1`,...
+            for i, ft in enumerate(body.named_children):
+                fields.append((f"_{i}", _slice(src_bytes, ft)))
+            if sname:
+                tuple_structs.add(sname)
+        elif body is not None:
             for fld in body.named_children:
                 if fld.type != "field_declaration":
                     continue
@@ -193,6 +210,30 @@ def parse_rust_file(
                     fields.append((_slice(src_bytes, fn), _slice(src_bytes, ft)))
         if sname and sname not in structs:
             structs[sname] = fields
+
+    def _ingest_enum(enum_node) -> None:
+        name_node = enum_node.child_by_field_name("name")
+        if name_node is None:
+            return
+        ename = _slice(src_bytes, name_node)
+        body = enum_node.child_by_field_name("body")
+        variants: list[str] = []
+        if body is not None:
+            for var in body.named_children:
+                if var.type != "enum_variant":
+                    continue
+                vn = var.child_by_field_name("name")
+                if vn is None:
+                    continue
+                # A variant carrying a payload (tuple/struct body) can't be
+                # nondeterministically constructed without its inner types;
+                # skip the whole enum so the existing unresolvable-type skip
+                # applies. Unit-only enums are constructable.
+                if var.child_by_field_name("body") is not None:
+                    return
+                variants.append(_slice(src_bytes, vn))
+        if ename and variants and ename not in enums:
+            enums[ename] = variants
 
     def _ingest_function(fn_node, impl_type: str = "") -> None:
         sig = _extract_signature(fn_node, src_bytes)
@@ -283,6 +324,8 @@ def parse_rust_file(
     for top in tree.root_node.children:
         if top.type == "struct_item":
             _ingest_struct(top)
+        if top.type == "enum_item":
+            _ingest_enum(top)
         if top.type == "function_item":
             _ingest_function(top)
         elif top.type == "impl_item":
@@ -351,6 +394,8 @@ def parse_rust_file(
         function_bodies=function_bodies,
         preprocessed_source=source_text if source_text is not None else None,
         structs=structs,
+        enums=enums,
+        tuple_structs=tuple_structs,
     )
 
 

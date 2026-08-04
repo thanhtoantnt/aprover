@@ -344,6 +344,20 @@ class DynamicValidator:
                 reasoning="Dynamic validation is disabled (enable_dynamic_validation=False).",
             )
 
+        # Dynamic validation builds a GCC/C harness and compiles it as C.
+        # For a Rust target (``.rs``) this can only fail: the generated .c
+        # #includes the Rust source and dies with "unknown type name 'mod'" /
+        # "use core::...". Rust has no C reproducer path — Kani IS the
+        # checker for these targets — so skip cleanly instead of emitting a
+        # misleading INCONCLUSIVE + a screen of C-compile noise.
+        _src = getattr(entry_func, "source_file", "") or ""
+        if _src.endswith(".rs"):
+            return DynamicValidationResult(
+                outcome=DynamicOutcome.SKIPPED,
+                reasoning=("Dynamic validation is C/GCC-only; skipped for Rust "
+                           "target (Kani is the checker). Source: " + _src),
+            )
+
         cc = self.config.dynamic_cc_path
         if not shutil.which(cc):
             return DynamicValidationResult(

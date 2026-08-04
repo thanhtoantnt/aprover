@@ -1967,7 +1967,7 @@ def _cmd_verify_dir(args: argparse.Namespace) -> int:
     if _fns.strip():
         only_functions = {f.strip() for f in _fns.split(",") if f.strip()}
         print(f"Only functions:      {sorted(only_functions)} (cross-file gen+refinement)")
-    results = pipeline.run_directory(
+    results = pipeline.verify_tree(
         source_dir=args.source_dir,
         driver_name=args.driver,
         include_dirs=include_dirs,

@@ -282,21 +282,35 @@ def run_kani_cargo(
                 capture_output=True, timeout=30,
             )
 
-    # Re-read after potential git checkout.
-    original_bytes = source_path.read_bytes()
-
+    # NOTE: original_bytes MUST be read AFTER acquiring the crate lock below.
+    # The pipeline verifies functions in parallel threads; reading it here
+    # (pre-lock) would snapshot another thread's mid-run dirty state, and
+    # this thread would then "restore" back to that dirty version — leaving
+    # the host crate polluted with a stale harness after the sweep.
     proof_block = _extract_harness_proof_block(harness_src)
     sentinel_start = f"\n// === bmc_agent cargo-kani harness {harness_name} -- DO NOT EDIT ===\n"
     sentinel_end = f"\n// === end bmc_agent harness {harness_name} ===\n"
-    appended = original_bytes + sentinel_start.encode() + proof_block.encode() + sentinel_end.encode()
     crate_lock = _acquire_crate_lock(crate_root)
     try:
+        # Read the clean snapshot while holding the lock: guarantees no other
+        # thread is mid-append, so restore always writes back a clean file.
+        original_bytes = source_path.read_bytes()
+        appended = original_bytes + sentinel_start.encode() + proof_block.encode() + sentinel_end.encode()
         source_path.write_bytes(appended)
         try:
             import os as _os, signal as _signal
+            _cmd = ["cargo", "kani", "--harness", harness_name,
+                    "--default-unwind", str(unwind)]
+            # Feature-gated crates (e.g. ylong_http compiles `h2`/`h3`/`hpack`
+            # only under their feature flag) never compile the target module
+            # under default features, so an appended proof harness is invisible
+            # to `cargo kani` ("no harnesses matched"). Let the caller enable the
+            # right feature set via env (e.g. BMC_AGENT_KANI_CARGO_FEATURES=http2).
+            _kf = _os.environ.get("BMC_AGENT_KANI_CARGO_FEATURES", "").strip()
+            if _kf:
+                _cmd += ["--features", _kf]
             _popen = _sub.Popen(
-                ["cargo", "kani", "--harness", harness_name,
-                 "--default-unwind", str(unwind)],
+                _cmd,
                 cwd=str(crate_root),
                 stdout=_sub.PIPE,
                 stderr=_sub.PIPE,
@@ -567,7 +581,9 @@ def _extract_counterexamples(raw: str) -> list[Counterexample]:
 
     for match in _REGULAR_CHECK_FAILURE_RE.finditer(raw):
         prop_id = match.group("prop").strip()
-        if ".unwind." in prop_id or ".reachability_check." in prop_id:
+        if (".unwind." in prop_id or ".reachability_check." in prop_id
+                or ".missing_definition." in prop_id
+                or ".unsupported_construct." in prop_id):
             continue
         desc = match.group("desc").strip()
         if prop_id in seen:
@@ -587,7 +603,9 @@ def _extract_counterexamples(raw: str) -> list[Counterexample]:
             prop_id = match.group(1).strip()
             # Skip reachability_check and unwind pseudo-failures —
             # neither indicates a real property violation.
-            if ".reachability_check." in prop_id or ".unwind." in prop_id:
+            if (".reachability_check." in prop_id or ".unwind." in prop_id
+                    or ".missing_definition." in prop_id
+                    or ".unsupported_construct." in prop_id):
                 continue
             desc = match.group(2).strip()
             if prop_id in seen:
